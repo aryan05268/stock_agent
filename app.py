@@ -5,6 +5,7 @@ import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 import sys
 import os
+import yfinance as yf
 
 # Adjust path to include the current folder
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
