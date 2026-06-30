@@ -19,3 +19,6 @@ scratch/
 # IDE files
 .vscode/
 .idea/
+
+# Project explanation documents and LaTeX compilation outputs
+PROJECT_EXPLANATION.*
