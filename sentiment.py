@@ -25,7 +25,8 @@ def analyze_headline_sentiment(headline: str) -> dict:
 
 def get_average_sentiment(news_items: list) -> float:
     """
-    Computes the average compound sentiment score for a list of news dictionaries.
+    Computes the average compound sentiment score for a list of news dictionaries,
+    filtering out duplicate headlines for accuracy.
     
     Returns:
     - Average compound score (float between -1.0 and 1.0)
@@ -33,11 +34,13 @@ def get_average_sentiment(news_items: list) -> float:
     if not news_items:
         return 0.0
     
+    unique_headlines = set()
     total_compound = 0.0
     valid_count = 0
     for item in news_items:
-        title = item.get('title', '')
-        if title:
+        title = item.get('title', '').strip()
+        if title and title not in unique_headlines:
+            unique_headlines.add(title)
             scores = analyze_headline_sentiment(title)
             total_compound += scores['compound']
             valid_count += 1

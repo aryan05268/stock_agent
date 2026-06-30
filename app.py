@@ -14,12 +14,13 @@ from data_loader import (
     fetch_stock_data, 
     fetch_stock_news, 
     fetch_company_info, 
-    fetch_industry_news
+    fetch_industry_news,
+    fetch_trending_tickers_with_ratings
 )
 from indicators import append_all_indicators
 from sentiment import get_average_sentiment, analyze_headline_sentiment
 from agent import generate_signals, get_latest_recommendation
-from backtester import run_backtest
+from backtester import run_backtest, run_multi_trade_backtest
 def get_ticker_difference_explanation(tickers: list) -> str:
     """
     Returns an educational explanation of the structural differences between selected tickers.
@@ -261,24 +262,97 @@ def expand_search_results(quotes: list, search_query: str) -> list:
                         
     return expanded
 
+def get_fetch_period(period: str) -> str:
+    """
+    Returns the minimum period to fetch from yfinance to ensure we have enough
+    historical data to calculate indicators (e.g. at least 1 year).
+    """
+    if period in ["3d", "1wk", "1mo", "3mo", "6mo", "1y"]:
+        return "1y"
+    elif period == "2y":
+        return "2y"
+    elif period == "5y":
+        return "5y"
+    elif period == "10y":
+        return "10y"
+    elif period == "max":
+        return "max"
+    return "1y"
+
+def slice_df_to_period(df: pd.DataFrame, period: str) -> pd.DataFrame:
+    """
+    Slices a DataFrame to the requested period based on its index.
+    """
+    if df.empty:
+        return df
+    
+    end_date = df.index[-1]
+    if period == "3d":
+        return df.tail(3)
+    elif period == "1wk":
+        start_date = end_date - pd.Timedelta(days=7)
+        sliced_df = df.loc[df.index >= start_date]
+        if len(sliced_df) < 5:
+            return df.tail(5)
+        return sliced_df
+    elif period == "1mo":
+        start_date = end_date - pd.Timedelta(days=30)
+        sliced_df = df.loc[df.index >= start_date]
+        if len(sliced_df) < 20:
+            return df.tail(20)
+        return sliced_df
+    elif period == "3mo":
+        start_date = end_date - pd.Timedelta(days=91)
+        sliced_df = df.loc[df.index >= start_date]
+        if len(sliced_df) < 60:
+            return df.tail(60)
+        return sliced_df
+    elif period == "6mo":
+        start_date = end_date - pd.Timedelta(days=182)
+        sliced_df = df.loc[df.index >= start_date]
+        if len(sliced_df) < 120:
+            return df.tail(120)
+        return sliced_df
+    elif period == "1y":
+        start_date = end_date - pd.Timedelta(days=365)
+        sliced_df = df.loc[df.index >= start_date]
+        if len(sliced_df) < 250:
+            return df.tail(250)
+        return sliced_df
+    elif period == "5y":
+        start_date = end_date - pd.Timedelta(days=365 * 5 + 1)
+        sliced_df = df.loc[df.index >= start_date]
+        if len(sliced_df) < 250 * 5:
+            return df.tail(250 * 5)
+        return sliced_df
+    elif period == "10y":
+        start_date = end_date - pd.Timedelta(days=365 * 10 + 2)
+        sliced_df = df.loc[df.index >= start_date]
+        if len(sliced_df) < 250 * 10:
+            return df.tail(250 * 10)
+        return sliced_df
+    return df
+
 def run_agent_analysis_for_comparison(ticker_symbol: str, period: str) -> dict:
     """
     Runs a fast technical and sentiment analysis on a comparison stock ticker.
     """
     ticker_symbol = ticker_symbol.upper().strip()
+    fetch_p = get_fetch_period(period)
+    
     # Resolve simple dot notation to hyphen if yfinance returns empty
     if '.' in ticker_symbol:
-        test_df = cached_fetch_stock_data(ticker_symbol, period=period)
+        test_df = cached_fetch_stock_data(ticker_symbol, period=fetch_p)
         if test_df.empty:
             ticker_symbol = ticker_symbol.replace('.', '-')
             
     try:
-        df_raw = cached_fetch_stock_data(ticker_symbol, period=period)
+        df_raw = cached_fetch_stock_data(ticker_symbol, period=fetch_p)
         if df_raw.empty:
             # Try Indian market suffix fallback if not appended
             if not ticker_symbol.endswith(('.NS', '.BO')):
                 test_ticker = f"{ticker_symbol}.NS"
-                test_df = cached_fetch_stock_data(test_ticker, period=period)
+                test_df = cached_fetch_stock_data(test_ticker, period=fetch_p)
                 if not test_df.empty:
                     ticker_symbol = test_ticker
                     df_raw = test_df
@@ -292,6 +366,10 @@ def run_agent_analysis_for_comparison(ticker_symbol: str, period: str) -> dict:
         sentiment = get_average_sentiment(news)
         df_ind = append_all_indicators(df_raw)
         df_sig = generate_signals(df_ind, news_sentiment=sentiment)
+        
+        # Slice both df_raw and df_sig to the requested period after indicators/signals generation
+        df_raw = slice_df_to_period(df_raw, period)
+        df_sig = slice_df_to_period(df_sig, period)
         
         latest_row = df_sig.iloc[-1]
         
@@ -337,7 +415,7 @@ def run_agent_analysis_for_comparison(ticker_symbol: str, period: str) -> dict:
 
         return {'error': f"Error parsing {ticker_symbol}: {str(e)}"}
 
-def call_provider_llm_api(provider: str, model: str, prompt: str, api_key: str, ollama_url: str = "http://localhost:11434") -> str:
+def call_provider_llm_api(provider: str, model: str, prompt: str, api_key: str, ollama_url: str = "http://localhost:11434", max_tokens: int = 1500) -> str:
     import urllib.request
     import json
     
@@ -349,7 +427,11 @@ def call_provider_llm_api(provider: str, model: str, prompt: str, api_key: str, 
         data = {
             "contents": [{
                 "parts": [{"text": prompt}]
-            }]
+            }],
+            "generationConfig": {
+                "temperature": 0.1,
+                "maxOutputTokens": max_tokens
+            }
         }
     elif provider == "openai":
         url = "https://api.openai.com/v1/chat/completions"
@@ -360,7 +442,8 @@ def call_provider_llm_api(provider: str, model: str, prompt: str, api_key: str, 
         data = {
             "model": model,
             "messages": [{"role": "user", "content": prompt}],
-            "temperature": 0.3
+            "temperature": 0.1,
+            "max_tokens": max_tokens
         }
     elif provider == "groq":
         url = "https://api.groq.com/openai/v1/chat/completions"
@@ -371,7 +454,8 @@ def call_provider_llm_api(provider: str, model: str, prompt: str, api_key: str, 
         data = {
             "model": model,
             "messages": [{"role": "user", "content": prompt}],
-            "temperature": 0.3
+            "temperature": 0.1,
+            "max_tokens": max_tokens
         }
     elif provider == "anthropic claude":
         url = "https://api.anthropic.com/v1/messages"
@@ -382,8 +466,9 @@ def call_provider_llm_api(provider: str, model: str, prompt: str, api_key: str, 
         }
         data = {
             "model": model,
-            "max_tokens": 1000,
-            "messages": [{"role": "user", "content": prompt}]
+            "max_tokens": max_tokens,
+            "messages": [{"role": "user", "content": prompt}],
+            "temperature": 0.1
         }
     elif provider == "local ollama":
         url = f"{ollama_url.rstrip('/')}/api/chat"
@@ -393,7 +478,11 @@ def call_provider_llm_api(provider: str, model: str, prompt: str, api_key: str, 
         data = {
             "model": model,
             "messages": [{"role": "user", "content": prompt}],
-            "stream": False
+            "stream": False,
+            "options": {
+                "temperature": 0.1,
+                "num_predict": max_tokens
+            }
         }
     elif provider == "ollama cloud":
         url = "https://ollama.com/api/chat"
@@ -404,7 +493,11 @@ def call_provider_llm_api(provider: str, model: str, prompt: str, api_key: str, 
         data = {
             "model": model,
             "messages": [{"role": "user", "content": prompt}],
-            "stream": False
+            "stream": False,
+            "options": {
+                "temperature": 0.1,
+                "num_predict": max_tokens
+            }
         }
     elif provider == "llama api (cloud/hosted)":
         url = ollama_url.strip()
@@ -417,14 +510,19 @@ def call_provider_llm_api(provider: str, model: str, prompt: str, api_key: str, 
             data = {
                 "model": model,
                 "messages": [{"role": "user", "content": prompt}],
-                "stream": False
+                "stream": False,
+                "options": {
+                    "temperature": 0.1,
+                    "num_predict": max_tokens
+                }
             }
         else:
             # Standard OpenAI compatible format
             data = {
                 "model": model,
                 "messages": [{"role": "user", "content": prompt}],
-                "temperature": 0.3
+                "temperature": 0.1,
+                "max_tokens": max_tokens
             }
     else:
         return f"Error: Unknown provider '{provider}'"
@@ -442,18 +540,28 @@ def call_provider_llm_api(provider: str, model: str, prompt: str, api_key: str, 
             res_json = json.loads(res_body)
             
             if provider == "google gemini":
-                return res_json['candidates'][0]['content']['parts'][0]['text']
+                text = res_json['candidates'][0]['content']['parts'][0]['text']
             elif provider in ("openai", "groq"):
-                return res_json['choices'][0]['message']['content']
+                text = res_json['choices'][0]['message']['content']
             elif provider == "anthropic claude":
-                return res_json['content'][0]['text']
+                text = res_json['content'][0]['text']
             elif provider in ("local ollama", "ollama cloud"):
-                return res_json['message']['content']
+                text = res_json['message']['content']
             elif provider == "llama api (cloud/hosted)":
                 if "/api/chat" in url:
-                    return res_json['message']['content']
+                    text = res_json['message']['content']
                 else:
-                    return res_json['choices'][0]['message']['content']
+                    text = res_json['choices'][0]['message']['content']
+            else:
+                text = ""
+                
+            if text:
+                # Clean up LaTeX/math tags that confuse the front-end markdown renderer
+                # Replace backslashed brackets/parentheses and double dollars with plain text
+                text = text.replace("\\[", "").replace("\\]", "").replace("\\(", "").replace("\\)", "")
+                text = text.replace("$$", "").replace("$", "")
+                return text
+            return "Error parsing response"
     except Exception as e:
         err_msg = str(e)
         if "10061" in err_msg or "refused" in err_msg:
@@ -466,30 +574,40 @@ def call_provider_llm_api(provider: str, model: str, prompt: str, api_key: str, 
             else:
                 return f"❌ **Connection Refused**: Could not connect to the Llama server at `{url}`.\n\n" \
                        f"Please verify your **Llama API Endpoint URL** and ensure it is correct."
-        return f"Error contacting {provider} API: {err_msg}"
-
 def get_llm_qa_response(question: str, tab_context: str, ticker: str, stock_stats: dict, provider: str, model: str, api_key: str, ollama_url: str) -> str:
-    prompt = f"""
-You are AlphaAgent, a senior quantitative financial analyst and AI agent.
-The user is asking a question about a stock or analysis tab on their dashboard.
+    # Base prompt for response generation
+    base_prompt = f"""
+You are AlphaAgent, a senior quantitative financial analyst.
 
-Context of current tab: {tab_context}
-Ticker: {ticker}
-Stock Name: {stock_stats.get('name', ticker)}
-Current Stock Price: ${stock_stats.get('price', 0.0):,.2f}
-Recent Stock Daily Change: {stock_stats.get('change_pct', 0.0):+.2f}%
-RSI (14): {stock_stats.get('rsi', 50.0):.1f}
-MACD Histogram: {stock_stats.get('macd_hist', 0.0):.4f}
-Average News Sentiment: {stock_stats.get('sentiment', 0.0):+.2f}
-
-Recent News Headlines analyzed:
+Context:
+- Current Tab / View: {tab_context}
+- Stock Ticker: {ticker}
+- Company Name: {stock_stats.get('name', ticker)}
+- Market Price: ${stock_stats.get('price', 0.0):,.2f} ({stock_stats.get('change_pct', 0.0):+.2f}%)
+- Technical indicators: RSI (14) = {stock_stats.get('rsi', 50.0):.1f}, MACD Histogram = {stock_stats.get('macd_hist', 0.0):.4f}
+- VADER news sentiment (last 15 headlines): {stock_stats.get('sentiment', 0.0):+.2f}
+- Recent Headlines:
 {stock_stats.get('news_summary', 'No headlines available')}
 
-User's Question: {question}
+User Query: {question}
 
-Provide a clear, detailed, and professional explanation. If the user asks about a term, explain the math and logic. If they ask about trends, timelines, or recent events, synthesize your general financial knowledge with the current stats and news provided. Keep the tone helpful, direct, and elite. Do not output HTML tags; use clean Markdown formatting.
+Instructions:
+1. Provide a complete, fully formed, and highly understandable answer.
+2. Translate complex financial terms, numbers, or logic into simple concepts using clear, intuitive analogies (e.g. explain like explaining to a 5-year-old, such as comparing RSI momentum to a runner slowing down, or Bollinger Bands to safety boundaries), but express them in a mature, professional language appropriate for adults.
+3. Base all details strictly on the provided context and verified financial facts; avoid speculative guesses.
+4. Structure & Formatting Requirements:
+   - Output in clean, highly structured Markdown.
+   - Use bold subheadings (e.g., ### Section Name) for logical sections.
+   - Use bullet points with bold key metrics.
+   - Separate distinct ideas with spacing or horizontal rules (`---`).
+   - Do not output any HTML tags.
+   - Start directly with the structured answer (no conversational preamble).
+   - IMPORTANT: DO NOT write any math symbols or equations using LaTeX delimiters like \\[, \\], \\(, \\), or double/single dollar signs ($). Write all mathematical equations and formulas in simple, plain english text representation (e.g., use "Sharpe Ratio = Mean Daily Return / Volatility" instead of LaTeX notation).
 """
-    return call_provider_llm_api(provider, model, prompt, api_key, ollama_url)
+
+    # Generate response directly with a generous max_tokens limit (e.g., 4000 tokens)
+    response = call_provider_llm_api(provider, model, base_prompt, api_key, ollama_url, max_tokens=4000)
+    return response
 
 def get_local_qa_response(question: str, tab_id: str, ticker: str, current_price: float, rsi: float, macd_hist: float, sentiment: float, rsi_oversold: float, rsi_overbought: float) -> str:
     q = question.lower()
@@ -612,6 +730,10 @@ def render_ai_assistant_widget(tab_id: str, tab_context: str, ticker: str, stock
 # --- STREAMLIT CACHING WRAPPERS ---
 
 # --- STREAMLIT CACHING WRAPPERS ---
+@st.cache_data(ttl=3600)  # Cache trending tickers for 1 hour
+def cached_fetch_trending_tickers():
+    return fetch_trending_tickers_with_ratings()
+
 @st.cache_data(ttl=3600)  # Cache company profile for 1 hour
 def cached_fetch_company_info(ticker_symbol: str) -> dict:
     return fetch_company_info(ticker_symbol)
@@ -785,6 +907,10 @@ st.markdown("""
 # ----------------- SIDEBAR -----------------
 st.sidebar.markdown("<h2 style='font-weight:800; background: linear-gradient(to right, #00f2fe, #4facfe); -webkit-background-clip: text; -webkit-text-fill-color: transparent;'>⚙️ Agent Settings</h2>", unsafe_allow_html=True)
 
+# Initialize recent searches list
+if 'recent_searches' not in st.session_state:
+    st.session_state.recent_searches = ["AAPL", "TSLA", "NVDA"]
+
 # Stock inputs
 if 'ticker_input' not in st.session_state:
     st.session_state.ticker_input = "AAPL"
@@ -798,6 +924,23 @@ ticker = st.sidebar.text_input(
 # Sync state
 st.session_state.ticker_input = ticker
 
+# If active ticker is valid and not already in recent searches, push it to history
+if ticker and ticker not in st.session_state.recent_searches:
+    st.session_state.recent_searches.insert(0, ticker)
+    # Limit to top 5 items
+    st.session_state.recent_searches = st.session_state.recent_searches[:5]
+
+# Render recent searches as pill suggestions
+if st.session_state.recent_searches:
+    st.sidebar.caption("🕒 Recent Searches (Click to Suggest):")
+    recent_cols = st.sidebar.columns(3)
+    for idx, recent_sym in enumerate(st.session_state.recent_searches):
+        col_idx = idx % 3
+        with recent_cols[col_idx]:
+            if st.button(recent_sym, key=f"recent_{recent_sym}_{idx}", use_container_width=True):
+                st.session_state.ticker_input = recent_sym
+                st.rerun()
+
 # Fetch company info early to get default industry search query
 try:
     comp_info = cached_fetch_company_info(ticker)
@@ -808,7 +951,7 @@ st.sidebar.markdown(f"**Analyzing:** {comp_info['name']}")
 if comp_info['sector'] != 'Unknown':
     st.sidebar.caption(f"Sector: {comp_info['sector']} | Industry: {comp_info['industry']}")
 
-time_period = st.sidebar.selectbox("Analysis Time Window", ["3mo", "6mo", "1y", "2y", "5y"], index=2)
+time_period = st.sidebar.selectbox("Analysis Time Window", ["3d", "1wk", "1mo", "3mo", "1y", "5y", "10y", "max"], index=4)
 starting_capital = st.sidebar.number_input("Starting Capital ($)", min_value=100.0, value=10000.0, step=100.0)
 live_streaming = st.sidebar.toggle("Real-Time Data Streaming", value=True, help="Enable continuously fluctuating and updating real-time data for the current date.")
 
@@ -885,6 +1028,48 @@ st.session_state["llm_provider"] = llm_provider
 st.session_state["selected_model"] = selected_model
 st.session_state["ollama_url"] = ollama_url
 
+# --- WEEKLY TRENDING TICKERS SIDEBAR EXPANDER ---
+st.sidebar.markdown("---")
+with st.sidebar.expander("🔥 Weekly Trending Tickers", expanded=True):
+    st.caption("Weekly search interest score & news breakouts:")
+    trending_list = cached_fetch_trending_tickers()
+    if trending_list:
+        for idx, item in enumerate(trending_list):
+            rank_emojis = ["🥇", "🥈", "🥉", "4️⃣", "5️⃣", "6️⃣", "7️⃣", "8️⃣", "9️⃣", "🔟"]
+            emoji = rank_emojis[idx] if idx < len(rank_emojis) else "📈"
+            
+            # Colored left border indicator based on score
+            score_color = "#00b09b" if item['score'] >= 85 else ("#ffd200" if item['score'] >= 75 else "#8f9cae")
+            
+            # Stunning premium card layout
+            st.markdown(f"""
+            <div style="background: rgba(255, 255, 255, 0.02); border: 1px solid rgba(255, 255, 255, 0.05); padding: 10px; border-radius: 12px; margin-bottom: 5px; border-left: 4px solid {score_color};">
+                <div style="display: flex; justify-content: space-between; align-items: center;">
+                    <span style="font-size: 1.05rem; font-weight: 800; color: #ffffff;">{emoji} {item['symbol']}</span>
+                    <span style="background: rgba(0, 242, 254, 0.1); border: 1px solid rgba(0, 242, 254, 0.3); padding: 2px 8px; border-radius: 8px; font-size: 0.8rem; font-weight: 700; color: #00f2fe;">🔥 {item['score']}%</span>
+                </div>
+                <div style="font-size: 0.78rem; color: #8f9cae; margin-top: 3px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;">
+                    {item['name']}
+                </div>
+            </div>
+            """, unsafe_allow_html=True)
+            
+            # Analysis action button
+            if st.button(f"Analyze {item['symbol']}", key=f"trend_btn_{item['symbol']}_{idx}", use_container_width=True):
+                st.session_state.ticker_input = item['symbol']
+                st.rerun()
+            st.markdown("<div style='margin-bottom: 10px;'></div>", unsafe_allow_html=True)
+    else:
+        st.write("No trending data available.")
+
+# --- DISCLAIMER / WARNING ---
+st.sidebar.markdown("---")
+st.sidebar.warning(
+    "⚠️ **Disclaimer**: This app does not claim or guarantee assured financial results. "
+    "Do not rely on the quantitative analysis, signals, sentiment scores, or AI consensus recommendations "
+    "completely. Investing involves high risk. Always make your own independent investment decisions."
+)
+
 # ----------------- HEADER -----------------
 live_badge_html = '<span class="live-badge"><span class="pulsing-dot"></span>LIVE STREAMING</span>' if live_streaming else ''
 
@@ -901,12 +1086,12 @@ st.markdown(f"""
 # ----------------- DATA LOADING -----------------
 try:
     with st.spinner("Fetching data and running AI agents..."):
-        df_raw = cached_fetch_stock_data(ticker, period=time_period)
+        df_raw = cached_fetch_stock_data(ticker, period=get_fetch_period(time_period))
         
         # 1. Fallback for Class Shares (e.g. BRK.A -> BRK-A)
         if df_raw.empty and '.' in ticker:
             fallback_ticker = ticker.replace('.', '-')
-            df_fallback = cached_fetch_stock_data(fallback_ticker, period=time_period)
+            df_fallback = cached_fetch_stock_data(fallback_ticker, period=get_fetch_period(time_period))
             if not df_fallback.empty:
                 df_raw = df_fallback
                 ticker = fallback_ticker
@@ -919,7 +1104,7 @@ try:
         # 2. Smart fallback for Indian markets (e.g. TCS -> TCS.NS)
         if df_raw.empty and not ticker.endswith(('.NS', '.BO')):
             fallback_ticker = f"{ticker}.NS"
-            df_fallback = cached_fetch_stock_data(fallback_ticker, period=time_period)
+            df_fallback = cached_fetch_stock_data(fallback_ticker, period=get_fetch_period(time_period))
             if not df_fallback.empty:
                 df_raw = df_fallback
                 ticker = fallback_ticker
@@ -1047,6 +1232,10 @@ try:
         df_signals.loc[df_signals['Agent_Score'] >= 0.25, 'Signal_Action'] = 'BUY'
         df_signals.loc[df_signals['Agent_Score'] <= -0.25, 'Signal_Action'] = 'SELL'
         
+        # Slice both df_raw and df_signals to the requested period after indicators/signals generation
+        df_raw = slice_df_to_period(df_raw, time_period)
+        df_signals = slice_df_to_period(df_signals, time_period)
+        
         # Recommendation
         latest_rec = get_latest_recommendation(df_signals, ticker, avg_sentiment)
         
@@ -1117,10 +1306,16 @@ try:
     
     with col1:
         current_price = latest_rec.get('price', 0.0)
+        prev_close = df_raw['Close'].iloc[-2] if len(df_raw) > 1 else current_price
+        if pd.isna(prev_close) or prev_close == 0:
+            non_null_closes = df_raw['Close'].dropna()
+            prev_close = non_null_closes.iloc[-2] if len(non_null_closes) > 1 else current_price
+            
+        change_pct = ((current_price - prev_close) / prev_close) * 100 if prev_close > 0 else 0.0
         st.metric(
             label="Current Stock Price",
             value=f"${current_price:,.2f}",
-            delta=f"{((current_price - df_raw['Close'].iloc[-2])/df_raw['Close'].iloc[-2])*100:.2f}% (Daily)"
+            delta=f"{change_pct:+.2f}% (Daily)"
         )
         
     with col2:
@@ -1158,7 +1353,7 @@ try:
     stock_stats = {
         'name': comp_info.get('name', ticker),
         'price': latest_rec.get('price', 0.0),
-        'change_pct': ((latest_rec.get('price', 0.0) - df_raw['Close'].iloc[-2])/df_raw['Close'].iloc[-2])*100 if len(df_raw) > 1 else 0.0,
+        'change_pct': change_pct,
         'rsi': latest_rsi,
         'macd_hist': latest_macd_hist,
         'sentiment': avg_sentiment,
@@ -1235,6 +1430,89 @@ try:
         fig.update_yaxes(showgrid=True, gridcolor='rgba(255, 255, 255, 0.05)')
         
         st.plotly_chart(fig, use_container_width=True)
+        
+        # Elegant collapsible guide for chart symbols & indicators
+        with st.expander("ℹ️ Learn to Read this Chart: Symbol & Indicator Legend", expanded=False):
+            st.markdown("""
+            <p style="font-size:0.95rem; color:#8f9cae; margin-bottom:1.2rem;">
+                Select a tab below to inspect the mathematical formulas, definitions, and actionable strategies for each indicator plotted on the charts.
+            </p>
+            """, unsafe_allow_html=True)
+            
+            tab_leg_signals, tab_leg_ma, tab_leg_vol, tab_leg_mom = st.tabs([
+                "📍 Trading Signals",
+                "📈 Moving Averages",
+                "🎯 Bollinger Bands",
+                "📊 RSI & MACD"
+            ])
+            
+            with tab_leg_signals:
+                st.markdown(r"""
+                ### 📍 Trading Signals & Price Action
+                
+                * <span style="background: rgba(0, 176, 155, 0.15); border: 1px solid #00b09b; color: #00b09b; padding: 2px 8px; border-radius: 4px; font-weight: bold; font-size: 0.85rem; min-width: 50px; text-align: center; display: inline-block;">▲ BUY</span> **Signal**
+                  * **Meaning & Math:** Plotted when the multi-agent decision model score ($Score_{Agent} \ge +0.25$). The score is a weighted consensus of technical metrics, company-specific sentiment, and macroeconomic/industry trends.
+                  * **How to Use & Benefit:** Represents a highly favorable entry zone. Investors can utilize these markers as potential buy entry signals, indicating a strong alignment of bullish indicators.
+                * <span style="background: rgba(255, 65, 108, 0.15); border: 1px solid #ff416c; color: #ff416c; padding: 2px 8px; border-radius: 4px; font-weight: bold; font-size: 0.85rem; min-width: 50px; text-align: center; display: inline-block;">▼ SELL</span> **Signal**
+                  * **Meaning & Math:** Plotted when the multi-agent decision model score ($Score_{Agent} \le -0.25$).
+                  * **How to Use & Benefit:** Represents a warning or potential profit-taking zone. Investors can use this to secure profits, set tighter stop-losses, or explore short positions.
+                * <span style="border-bottom: 2px solid #4facfe; width: 30px; display: inline-block; vertical-align: middle; margin-right: 8px;"></span> **Close Price**
+                  * **Meaning & Math:** The final transaction price recorded for the stock at the end of the trading day.
+                  * **How to Use & Benefit:** Used as the baseline pricing reference. Looking at close price support (historical price floors where buying stops declines) and resistance (price ceilings where selling stops rallies) helps determine key breakouts.
+                """, unsafe_allow_html=True)
+                
+            with tab_leg_ma:
+                st.markdown(r"""
+                ### 📈 Moving Averages (Trend Lines)
+                
+                * <span style="border-bottom: 2px dashed #ffd200; width: 30px; display: inline-block; vertical-align: middle; margin-right: 8px;"></span> **SMA 20 (Simple Moving Average)**
+                  * **Meaning & Math:** The 20-day rolling average of closing prices. 
+                    $$SMA_{20} = \frac{1}{20}\sum_{i=1}^{20} Close_{t-i+1}$$
+                  * **How to Use & Benefit:** Identifies the short-term trend direction. If the stock price stays above the SMA 20, the short-term momentum is bullish.
+                * <span style="border-bottom: 2px dotted #ff4b2b; width: 30px; display: inline-block; vertical-align: middle; margin-right: 8px;"></span> **SMA 50 (Simple Moving Average)**
+                  * **Meaning & Math:** The 50-day rolling average of closing prices. 
+                    $$SMA_{50} = \frac{1}{50}\sum_{i=1}^{50} Close_{t-i+1}$$
+                  * **How to Use & Benefit:** Identifies the medium-term trend direction.
+                * **💡 Actionable Crossover Strategy:**
+                  * **Golden Cross (Bullish):** When the fast-moving SMA 20 crosses *above* the slow-moving SMA 50. This indicates upward momentum is accelerating—typically a strong buy signal.
+                  * **Death Cross (Bearish):** When the SMA 20 crosses *below* the SMA 50. This indicates downward momentum is accelerating—typically a signal to sell or reduce exposure.
+                """, unsafe_allow_html=True)
+                
+            with tab_leg_vol:
+                st.markdown(r"""
+                ### 🎯 Bollinger Bands (Volatility & Envelopes)
+                
+                * <span style="background: rgba(255, 255, 255, 0.05); border: 1px solid rgba(255, 255, 255, 0.15); width: 30px; height: 16px; display: inline-block; border-radius: 2px; vertical-align: middle; margin-right: 8px;"></span> **Bollinger Bands Channel**
+                  * **Meaning & Math:** A volatility envelope plotted at standard deviations above and below the SMA 20.
+                    $$\text{Middle Band} = SMA_{20}$$
+                    $$\text{Upper Band} = SMA_{20} + (2 \times \sigma_{20})$$
+                    $$\text{Lower Band} = SMA_{20} - (2 \times \sigma_{20})$$
+                    *(where \sigma_{20} is the 20-day standard deviation of the stock price)*
+                  * **How to Use & Benefit:**
+                    * **Volatility Squeeze:** When upper and lower bands contract tightly together (narrow gap), it indicates low volatility. This often acts as a precursor to a major price breakout. Preparing a trade for this breakout can yield large moves.
+                    * **Overbought/Oversold Reversals:** Statistically, about 95% of price action remains within the bands. If the price touches the Upper Band, the asset is relatively expensive/overbought (consider taking profit). If it touches the Lower Band, it is relatively cheap/oversold (consider entering a position).
+                """, unsafe_allow_html=True)
+                
+            with tab_leg_mom:
+                st.markdown(r"""
+                ### 📊 Momentum & Trend Oscillators
+                
+                * <span style="border-bottom: 2px solid #a18cd1; width: 30px; display: inline-block; vertical-align: middle; margin-right: 8px;"></span> **RSI (Relative Strength Index)**
+                  * **Meaning & Math:** A momentum oscillator that scales price changes from 0 to 100.
+                    $$RSI = 100 - \left(\frac{100}{1 + RS}\right)$$
+                    $$\text{where } RS = \frac{\text{Average Gain of Up Days}}{\text{Average Loss of Down Days}} \text{ over 14 periods.}$$
+                  * **How to Use & Benefit:**
+                    * **Oversold (< 30):** Indicates the stock is heavily sold off and due for a bullish correction. **Benefit:** Look to purchase shares at a discount.
+                    * **Overbought (> 70):** Indicates excessive buying momentum that might be exhausted. **Benefit:** Consider lock-in profit before a pullback occurs.
+                * <span style="border-bottom: 2px solid #00f2fe; width: 30px; display: inline-block; vertical-align: middle; margin-right: 8px;"></span> **MACD Line &** <span style="border-bottom: 2px solid #f7971e; width: 30px; display: inline-block; vertical-align: middle; margin-right: 8px;"></span> **Signal Line**
+                  * **Meaning & Math:** 
+                    $$\text{MACD Line} = EMA_{12}(Close) - EMA_{26}(Close)$$
+                    $$\text{Signal Line} = EMA_{9}(\text{MACD Line})$$
+                    $$\text{Histogram (Gray Bars)} = \text{MACD Line} - \text{Signal Line}$$
+                  * **How to Use & Benefit:**
+                    * **Bullish Crossover:** When the cyan MACD line crosses *above* the orange Signal Line, the gray histogram turns positive. This shows buyers are gaining control. **Benefit:** Open long positions.
+                    * **Bearish Crossover:** When the MACD line crosses *below* the Signal Line, the histogram turns negative, indicating sellers are gaining control. **Benefit:** Exit or reduce holdings.
+                """, unsafe_allow_html=True)
         
         # Display Agent Recommendation Reasoning Card
         st.markdown("### Agent Signal Rationale")
@@ -1888,34 +2166,84 @@ try:
         run_ma_analysis = st.button("🤖 Run Multi-Agent Consensus Analysis Panel", key="run_ma_btn")
         
         if run_ma_analysis or ma_state_key in st.session_state:
+            # We calculate this on every rerun to make sure it's available for rendering the TL;DR card
+            multi_trade_results = run_multi_trade_backtest(df_signals, initial_capital=starting_capital)
+            
             # Execute analysis if triggered or already exists
             if run_ma_analysis or ma_state_key not in st.session_state:
-                # 1. Agent 1: Chart Intelligence Analyst
-                with st.spinner("Invoking Agent 1: Chart Intelligence Analyst..."):
+                # Trading Agent: Active Multi-Trade Simulator
+                with st.spinner("Invoking Active Multi-Trade Simulator..."):
+                    trades_sample = multi_trade_results.get('trades', [])[:10]
+                    formatted_trades_sample = []
+                    for t in trades_sample:
+                        formatted_trades_sample.append(
+                            f"[{t['date']}] {t['type']} at ${t['price']:.2f} (Shares: {t['shares']:.2f}, PortVal: ${t['portfolio_value']:.2f})"
+                        )
+                    trades_context = "\n".join(formatted_trades_sample) if formatted_trades_sample else "No trades triggered"
+                    
+                    prompt_a5 = f"""
+You are the Active Multi-Trade Simulator. Review the active multi-trade strategy results and trade logs for {ticker}.
+
+Active Strategy Performance:
+- Initial Capital: ${starting_capital:,.2f}
+- Final Strategy Value: ${multi_trade_results.get('final_value', 0.0):,.2f}
+- Multi-Trade Return: {multi_trade_results.get('strategy_return_pct', 0.0):.2f}%
+- Benchmark (Buy & Hold) Return: {multi_trade_results.get('benchmark_return_pct', 0.0):.2f}%
+- Total Trades Triggered: {multi_trade_results.get('total_trades', 0)}
+
+Trade Logs Sample (Daily Close Execution mimicking the market):
+{trades_context}
+
+Instructions:
+1. Explain this active trading strategy (scaling in 25% on BUY signals, scaling out 50% on SELL signals) and compare its return and risk (such as capital preservation) against a simple Buy & Hold.
+2. Outline specific trades from the logs to explain how executing multiple trades (instead of a single all-in/all-out position) affected the portfolio value generated.
+3. Keep the tone professional, adult-appropriate, and easy to understand.
+4. Structure & Formatting Requirements:
+   - Output in clean, highly structured Markdown.
+   - Use bold subheadings (e.g., ### Section Name) for logical sections.
+   - Use bullet points with bold key metrics.
+   - Separate distinct ideas with spacing or horizontal rules (`---`).
+   - Start directly with the structured answer (no conversational preamble).
+   - IMPORTANT: DO NOT write any math symbols or equations using LaTeX delimiters like \\[, \\], \\(, \\), or double/single dollar signs ($). Write all mathematical equations and formulas in simple, plain english text representation.
+"""
+                    if is_active:
+                        agent5_output = call_provider_llm_api(llm_provider, selected_model, prompt_a5, gemini_api_key, ollama_url)
+                    else:
+                        agent5_output = f"""
+- **Active Execution Return**: Generated **{multi_trade_results.get('strategy_return_pct', 0.0):.2f}%** return vs **{multi_trade_results.get('benchmark_return_pct', 0.0):.2f}%** benchmark.
+- **Trades Executed**: Triggered a total of **{multi_trade_results.get('total_trades', 0)}** active market-mimicking scale-in/scale-out events.
+- **Allocation Value**: Ended with a total capital of **${multi_trade_results.get('final_value', 0.0):,.2f}** from an initial **${starting_capital:,.2f}**.
+- **Execution Profile**: Splits capital into 25% tranches on BUY signals to buy at different price levels, and sells 50% of the position on SELL signals to lock in partial profits.
+"""
+
+                # Chart Intelligence Analyst
+                with st.spinner("Invoking Chart Intelligence Analyst..."):
                     prompt_a1 = f"""
-You are Agent 1 (Chart Intelligence Analyst), an expert technical stock chartist.
-Your task is to analyze all chart data and indicators for {ticker} (Sector: {comp_info.get('sector', 'Unknown')}, Industry: {comp_info.get('industry', 'Unknown')}).
+You are the Chart Intelligence Analyst. Provide a complete and precise summary of the price action and technical indicators for {ticker} (Sector: {comp_info.get('sector', 'Unknown')}, Industry: {comp_info.get('industry', 'Unknown')}).
 
-Latest Candle Data:
-- Date: {latest_rec.get('timestamp')}
-- Open: ${latest_row.get('Open', 0.0):,.2f}
-- High: ${latest_row.get('High', 0.0):,.2f}
-- Low: ${latest_row.get('Low', 0.0):,.2f}
-- Close: ${latest_row.get('Close', 0.0):,.2f}
-- Volume: {latest_row.get('Volume', 0.0):,}
+Active Multi-Trade Simulator Data:
+---
+{agent5_output}
+---
 
-Technical Indicators:
-- SMA 20: ${latest_row.get('SMA_20', 0.0):,.2f}
-- SMA 50: ${latest_row.get('SMA_50', 0.0):,.2f}
-- Bollinger Band Upper: ${latest_row.get('BB_Upper', 0.0):,.2f}
-- Bollinger Band Middle: ${latest_row.get('BB_Middle', 0.0):,.2f}
-- Bollinger Band Lower: ${latest_row.get('BB_Lower', 0.0):,.2f}
-- RSI (14): {latest_row.get('RSI', 50.0):.2f}
-- MACD Line: {latest_row.get('MACD', 0.0):.4f}
-- MACD Signal Line: {latest_row.get('MACD_Signal', 0.0):.4f}
-- MACD Histogram: {latest_row.get('MACD_Hist', 0.0):.4f}
+Context & Latest Data:
+- Candle: Date={latest_rec.get('timestamp')}, Close=${latest_row.get('Close', 0.0):,.2f}, Volume={latest_row.get('Volume', 0.0):,}
+- Indicators: SMA_20=${latest_row.get('SMA_20', 0.0):,.2f}, SMA_50=${latest_row.get('SMA_50', 0.0):,.2f}
+- Bollinger Bands: Upper=${latest_row.get('BB_Upper', 0.0):,.2f}, Mid=${latest_row.get('BB_Middle', 0.0):,.2f}, Lower=${latest_row.get('BB_Lower', 0.0):,.2f}
+- Momentum: RSI(14)={latest_row.get('RSI', 50.0):.2f}, MACD_Hist={latest_row.get('MACD_Hist', 0.0):.4f}
 
-Analyze the moving average trends (bullish/bearish crossover), RSI momentum (oversold/overbought/neutral), Bollinger Band range (is the price touching/breaking bands?), and MACD crossovers. Summarize your findings in a structured report. Avoid HTML tags; use markdown.
+Instructions:
+1. Provide a complete, fully formed explanation of trend status, RSI momentum, Bollinger Band position, and MACD crossover.
+2. Integrate Trading Agent Data: Analyze how the active trading simulator's specific trade entry/exit dates and execution prices align with these technical chart trendlines and support/resistance boundaries (e.g. did it buy near SMA support or sell near BB upper band resistance).
+3. Explain technical patterns using simple analogies (like a runner's speed for RSI, or rubber bands stretching for Bollinger Bands) in a professional tone suitable for adults.
+4. Structure & Formatting Requirements:
+   - Output in clean, highly structured Markdown.
+   - Use bold subheadings (e.g., ### Section Name) for logical sections.
+   - Use bullet points with bold key metrics.
+   - Separate distinct ideas with spacing or horizontal rules (`---`).
+   - Do not output any HTML tags.
+   - Start directly with the structured answer (no conversational preamble).
+   - IMPORTANT: DO NOT write any math symbols or equations using LaTeX delimiters like \\[, \\], \\(, \\), or double/single dollar signs ($). Write all mathematical equations and formulas in simple, plain english text representation.
 """
                     if is_active:
                         agent1_output = call_provider_llm_api(llm_provider, selected_model, prompt_a1, gemini_api_key, ollama_url)
@@ -1931,30 +2259,37 @@ Analyze the moving average trends (bullish/bearish crossover), RSI momentum (ove
 - **RSI Momentum**: The Relative Strength Index (RSI) is at **{latest_rsi:.2f}**, which indicates **{rsi_desc}** status.
 - **MACD Trend**: A **{macd_desc}** is observed, with the histogram at **{latest_macd_hist:.4f}**.
 - **Volatility Boundaries**: The price is **{bb_desc}**, indicating bounded range volatility movement.
+- **Trading Simulator Alignment**: The Active Multi-Trade Simulator's scale-in/scale-out decisions corresponded to these trend conditions, buying tranches during support tests and selling during momentum reversals.
 """
                 
-                # 2. Agent 2: Quantitative Metrics Parser
-                with st.spinner("Invoking Agent 2: Quantitative Metrics Parser..."):
+                # Quantitative Metrics Parser
+                with st.spinner("Invoking Quantitative Metrics Parser..."):
                     prompt_a2 = f"""
-You are Agent 2 (Quantitative Metrics Parser), a math and data-focused quantitative analyst.
-Your task is to examine the numerical performance metrics, news sentiment, and backtesting statistics for {ticker}.
+You are the Quantitative Metrics Parser. Perform a precise mathematical review of backtest execution and sentiment statistics for {ticker}.
 
-Performance Metrics:
-- Starting Capital: ${starting_capital:,.2f}
-- Final Portfolio Value: ${backtest_results.get('final_value', 0.0):,.2f}
-- Strategy Return: {backtest_results.get('strategy_return_pct', 0.0):.2f}%
-- Benchmark Return (Buy & Hold): {backtest_results.get('benchmark_return_pct', 0.0):.2f}%
-- Strategy Excess Return: {backtest_results.get('strategy_return_pct', 0.0) - backtest_results.get('benchmark_return_pct', 0.0):+.2f}%
-- Max Drawdown: {backtest_results.get('max_drawdown_pct', 0.0):.2f}%
-- Total Trades Executed: {backtest_results.get('total_trades', 0)}
-- Volatility: {backtest_results.get('volatility_pct', 0.0):.2f}%
+Active Multi-Trade Simulator Data:
+---
+{agent5_output}
+---
 
-Sentiment Metrics:
-- Company Specific News Sentiment (VADER): {avg_sentiment:+.2f}
-- Industry News Sentiment (VADER): {avg_industry_sentiment:+.2f}
-- Agent Combined Score (-1.0 to 1.0): {latest_rec.get('score', 0.0):+.2f}
+Metrics Context:
+- Capital: Starting=${starting_capital:,.2f}, Strategy Final=${backtest_results.get('final_value', 0.0):,.2f}
+- Return: Strategy={backtest_results.get('strategy_return_pct', 0.0):.2f}%, Benchmark (Buy & Hold)={backtest_results.get('benchmark_return_pct', 0.0):.2f}%, Excess={backtest_results.get('strategy_return_pct', 0.0) - backtest_results.get('benchmark_return_pct', 0.0):+.2f}%
+- Risk: Max Drawdown={backtest_results.get('max_drawdown_pct', 0.0):.2f}%, Volatility={backtest_results.get('volatility_pct', 0.0):.2f}%, Trades={backtest_results.get('total_trades', 0)}
+- Sentiment: Company Sentiment={avg_sentiment:+.2f}, Industry Sentiment={avg_industry_sentiment:+.2f}, Combined Score={latest_rec.get('score', 0.0):+.2f}
 
-Evaluate the efficiency of the backtested strategy compared to the benchmark, volatility vs drawdown risks, and how company vs industry news sentiment impacts the numbers. Summarize your quantitative review in a structured report. Avoid HTML tags; use markdown.
+Instructions:
+1. Provide a complete, fully formed quantitative analysis of returns, risks (drawdown and volatility), and sentiment scores.
+2. Integrate Trading Agent Data: Compare the risk/reward and efficiency of the active multi-trade simulator vs simple Buy & Hold and all-in/all-out systems, showing mathematically how the multiple executions altered drawdowns and Sharpe Ratio.
+3. Translate mathematical details into simple intuitive concepts (like savings account comparisons or risk protections) in mature, professional language.
+4. Structure & Formatting Requirements:
+   - Output in clean, highly structured Markdown.
+   - Use bold subheadings (e.g., ### Section Name) for logical sections.
+   - Use bullet points with bold key metrics.
+   - Separate distinct ideas with spacing or horizontal rules (`---`).
+   - Do not output any HTML tags.
+   - Start directly with the structured answer (no conversational preamble).
+   - IMPORTANT: DO NOT write any math symbols or equations using LaTeX delimiters like \\[, \\], \\(, \\), or double/single dollar signs ($). Write all mathematical equations and formulas in simple, plain english text representation.
 """
                     if is_active:
                         agent2_output = call_provider_llm_api(llm_provider, selected_model, prompt_a2, gemini_api_key, ollama_url)
@@ -1965,25 +2300,42 @@ Evaluate the efficiency of the backtested strategy compared to the benchmark, vo
 - **Excess Return**: The strategy beat the benchmark by **{excess:+.2f}%**.
 - **Risk Metrics**: Max Drawdown was capped at **{backtest_results.get('max_drawdown_pct', 0.0):.2f}%** with annualized volatility of **{backtest_results.get('volatility_pct', 0.0):.2f}%**.
 - **Sentiment Scores**: Ticker sentiment compound score is **{avg_sentiment:+.2f}**, and industry/sector query sentiment is **{avg_industry_sentiment:+.2f}**.
+- **Trading Simulator Comparison**: The Active Multi-Trade Simulator's scale-in/scale-out approach generated **{multi_trade_results.get('strategy_return_pct', 0.0):.2f}%** return, highlighting the mathematical advantages of capital scaling over binary entry.
 """
 
-                # 3. Agent 3: Synthesis & Consensus Engine
-                with st.spinner("Invoking Agent 3: Synthesis & Consensus Engine..."):
+                # Synthesis & Consensus Engine
+                with st.spinner("Invoking Synthesis & Consensus Engine..."):
                     prompt_a3 = f"""
-You are Agent 3 (Synthesis & Consensus Engine), a Chief Investment Officer (CIO) and synthesis expert.
-Your task is to combine the analysis from Agent 1 (Chart Analyst) and Agent 2 (Quantitative Numbers Analyst) to derive a single, well-formed, final consensus rating and analytical report for {ticker}.
+You are the Synthesis & Consensus Engine. Act as the Chief Investment Officer to synthesize findings and generate a final rating consensus for {ticker}.
 
-Output of Agent 1 (Chart Analyst):
+Active Multi-Trade Simulator Data:
+---
+{agent5_output}
+---
+
+Technical Inputs:
 ---
 {agent1_output}
 ---
 
-Output of Agent 2 (Quantitative Numbers Analyst):
+Quantitative Inputs:
 ---
 {agent2_output}
 ---
 
-Synthesize these inputs. Address technical alignments (e.g. are charts confirming the numbers?). Resolve any conflicting indicators (e.g., strong charts but weak news sentiment). Provide a final consolidated analysis, a clear investment rating (Strong Buy, Buy, Hold, Sell, or Strong Sell), and a detailed reasoning summary. Avoid HTML tags; use markdown.
+Instructions:
+1. Synthesize chart indicators, quantitative metrics, and active multi-trade outcomes to produce a complete consensus report.
+2. State a bold **Consensus Rating**: [Strong Buy / Buy / Hold / Sell / Strong Sell], followed by key bulleted rationale.
+3. Integrate Trading Agent Data: Address how the active trading returns support or contradict the technical signals and statistical metrics to reach a final result.
+4. Explain the consensus using simple concepts (explaining conflicts or confirmations clearly) but in professional, adult-appropriate language.
+5. Structure & Formatting Requirements:
+   - Output in clean, highly structured Markdown.
+   - Use bold subheadings (e.g., ### Section Name) for logical sections.
+   - Use bullet points with bold key metrics.
+   - Separate distinct ideas with spacing or horizontal rules (`---`).
+   - Do not output any HTML tags.
+   - Start directly with the structured answer (no conversational preamble).
+   - IMPORTANT: DO NOT write any math symbols or equations using LaTeX delimiters like \\[, \\], \\(, \\), or double/single dollar signs ($). Write all mathematical equations and formulas in simple, plain english text representation.
 """
                     if is_active:
                         agent3_output = call_provider_llm_api(llm_provider, selected_model, prompt_a3, gemini_api_key, ollama_url)
@@ -1992,12 +2344,13 @@ Synthesize these inputs. Address technical alignments (e.g. are charts confirmin
 - **Consensus Rating**: **{latest_rec.get('action', 'HOLD')}** (Consensus Score: **{latest_rec.get('score', 0.0):+.2f}**)
 - **Consensus Findings**:
   - The technical charts suggest a momentum profile of **{latest_rsi:.1f}** with positive/negative MACD acceleration.
-  - The backtest validates this with a Strategy Return of **{backtest_results.get('strategy_return_pct', 0.0):.1f}%**.
+  - The backtest validates this with a Strategy Return of **{backtest_results.get('strategy_return_pct', 0.0):.1f}%** for all-in/all-out.
+  - The Active Multi-Trade Simulator generated a return of **{multi_trade_results.get('strategy_return_pct', 0.0):.1f}%** across **{multi_trade_results.get('total_trades', 0)}** active executions.
   - Combining these insights, our consensus panel rates the stock as a **{latest_rec.get('action', 'HOLD')}**.
 """
-
-                # 4. Agent 4: Portfolio Allocation Advisor
-                with st.spinner("Invoking Agent 4: Portfolio Allocation Advisor..."):
+                
+                # Portfolio Allocation Advisor
+                with st.spinner("Invoking Portfolio Allocation Advisor..."):
                     COMPETITORS_MAP = {
                         "AAPL": ["MSFT", "GOOGL", "NVDA", "AMZN"],
                         "MSFT": ["AAPL", "GOOGL", "AMZN", "META"],
@@ -2014,25 +2367,35 @@ Synthesize these inputs. Address technical alignments (e.g. are charts confirmin
                     }
                     peers = COMPETITORS_MAP.get(ticker.upper(), ["SPY", "QQQ", "IWM"])
                     prompt_a4 = f"""
-You are Agent 4 (Portfolio Allocation Advisor), an elite wealth manager and stock selector.
-Your task is to review the synthesis report from Agent 3, and recommend if {ticker} is the best option for the investor's capital, or if there are other better performing stocks in the same sector/industry (e.g., competitors: {", ".join(peers)}).
+You are the Portfolio Allocation Advisor. Review the consensus synthesis and recommend the capital allocation profile for {ticker}.
 
-Consensus Synthesis from Agent 3:
+Active Multi-Trade Simulator Data:
+---
+{agent5_output}
+---
+
+Consensus Synthesis:
 ---
 {agent3_output}
 ---
 
-Investor Profiles:
-- Starting Capital: ${starting_capital:,.2f}
-- Target Stock: {ticker} (Sector: {comp_info.get('sector', 'Unknown')}, Industry: {comp_info.get('industry', 'Unknown')})
+Investor Context:
+- Capital: ${starting_capital:,.2f}
+- Ticker: {ticker} | Peers: {", ".join(peers)}
 
-Provide:
-1. A direct comparison logic comparing {ticker} against its primary peers (mentioning specific competitors if relevant).
-2. A clear recommendation: Is {ticker} a buy, or is there a better alternative (e.g. {", ".join(peers[:2])})?
-3. Allocation & Entry Strategy:
-   - What entry price is suitable to invest in {ticker} (recommend a price based on SMA 20, Bollinger bands, or recent range)?
-   - How much of the starting capital (${starting_capital:,.2f}) is suitable to invest (e.g. percentage or dollar allocation)?
-Explain your logic and reasoning clearly. Avoid HTML tags; use markdown.
+Instructions:
+1. Provide a complete, fully formed comparison, allocation rating, and entry strategy.
+2. Integrate Trading Agent Data: Use the active multi-trade outcomes and entry log statistics to optimize the sizing, average cost target, and entry trigger prices.
+3. Outline **Alternative Analysis** (competitors comparison) and **Asset Allocation** (sizing and entry trigger prices) in simple terms (e.g. entry compared to shopping on a discount, or sizing to not putting all eggs in one basket).
+4. Keep the tone professional for adults but extremely easy to understand.
+5. Structure & Formatting Requirements:
+   - Output in clean, highly structured Markdown.
+   - Use bold subheadings (e.g., ### Section Name) for logical sections.
+   - Use bullet points with bold key metrics.
+   - Separate distinct ideas with spacing or horizontal rules (`---`).
+   - Do not output any HTML tags.
+   - Start directly with the structured answer (no conversational preamble).
+   - IMPORTANT: DO NOT write any math symbols or equations using LaTeX delimiters like \\[, \\], \\(, \\), or double/single dollar signs ($). Write all mathematical equations and formulas in simple, plain english text representation.
 """
                     if is_active:
                         agent4_output = call_provider_llm_api(llm_provider, selected_model, prompt_a4, gemini_api_key, ollama_url)
@@ -2047,6 +2410,7 @@ Explain your logic and reasoning clearly. Avoid HTML tags; use markdown.
 3. **Allocation Sizing**:
    - **Recommended Entry Price**: **${rec_price:,.2f}** (aligned with its 20-day Simple Moving Average boundary).
    - **Suggested Capital Allocation**: **15%** of your starting capital, which equates to **${rec_alloc:,.2f}** from your total **${starting_capital:,.2f}**.
+- **Trading Simulator Integration**: Based on the active multi-trade simulations, we suggest using 25% tranches for entry to average down purchase costs, targeting the **${rec_price:,.2f}** zone.
 """
 
                 # Save results to session state
@@ -2054,46 +2418,76 @@ Explain your logic and reasoning clearly. Avoid HTML tags; use markdown.
                     "agent1": agent1_output,
                     "agent2": agent2_output,
                     "agent3": agent3_output,
-                    "agent4": agent4_output
+                    "agent4": agent4_output,
+                    "agent5": agent5_output
                 }
             
             # Display results
             results = st.session_state[ma_state_key]
             
-            # Show grid of results
-            col_a1, col_a2 = st.columns(2)
-            with col_a1:
-                st.markdown("""
-                <div style="background: rgba(30, 30, 60, 0.2); border: 1px solid rgba(255, 255, 255, 0.05); padding: 1.5rem; border-radius: 15px; margin-bottom: 1rem; border-left: 5px solid #00f2fe;">
-                    <h4 style="color: #00f2fe; margin-top: 0; display: flex; align-items: center; gap: 0.5rem;">📊 Agent 1: Chart Intelligence Analyst</h4>
-                """, unsafe_allow_html=True)
-                st.markdown(results["agent1"])
-                st.markdown("</div>", unsafe_allow_html=True)
-                
-            with col_a2:
-                st.markdown("""
-                <div style="background: rgba(30, 30, 60, 0.2); border: 1px solid rgba(255, 255, 255, 0.05); padding: 1.5rem; border-radius: 15px; margin-bottom: 1rem; border-left: 5px solid #ffd200;">
-                    <h4 style="color: #ffd200; margin-top: 0; display: flex; align-items: center; gap: 0.5rem;">🔢 Agent 2: Quantitative Metrics Parser</h4>
-                """, unsafe_allow_html=True)
-                st.markdown(results["agent2"])
-                st.markdown("</div>", unsafe_allow_html=True)
+            # Display results vertically
+            st.markdown("""
+            <div style="background: rgba(30, 30, 60, 0.2); border: 1px solid rgba(255, 255, 255, 0.05); padding: 1.5rem; border-radius: 15px; margin-bottom: 1.5rem; border-left: 5px solid #ff4b2b;">
+                <h4 style="color: #ff4b2b; margin-top: 0; display: flex; align-items: center; gap: 0.5rem;">⚡ Active Multi-Trade Simulator</h4>
+            """, unsafe_allow_html=True)
+            st.markdown(results["agent5"])
+            st.markdown("</div>", unsafe_allow_html=True)
+
+            st.markdown("""
+            <div style="background: rgba(30, 30, 60, 0.2); border: 1px solid rgba(255, 255, 255, 0.05); padding: 1.5rem; border-radius: 15px; margin-bottom: 1.5rem; border-left: 5px solid #00f2fe;">
+                <h4 style="color: #00f2fe; margin-top: 0; display: flex; align-items: center; gap: 0.5rem;">📊 Chart Intelligence Analyst</h4>
+            """, unsafe_allow_html=True)
+            st.markdown(results["agent1"])
+            st.markdown("</div>", unsafe_allow_html=True)
             
-            col_a3, col_a4 = st.columns(2)
-            with col_a3:
-                st.markdown("""
-                <div style="background: rgba(30, 30, 60, 0.2); border: 1px solid rgba(255, 255, 255, 0.05); padding: 1.5rem; border-radius: 15px; margin-bottom: 1rem; border-left: 5px solid #a18cd1;">
-                    <h4 style="color: #a18cd1; margin-top: 0; display: flex; align-items: center; gap: 0.5rem;">🧠 Agent 3: Synthesis & Consensus Engine</h4>
-                """, unsafe_allow_html=True)
-                st.markdown(results["agent3"])
-                st.markdown("</div>", unsafe_allow_html=True)
-                
-            with col_a4:
-                st.markdown("""
-                <div style="background: rgba(30, 30, 60, 0.2); border: 1px solid rgba(255, 255, 255, 0.05); padding: 1.5rem; border-radius: 15px; margin-bottom: 1rem; border-left: 5px solid #00b09b;">
-                    <h4 style="color: #00b09b; margin-top: 0; display: flex; align-items: center; gap: 0.5rem;">🎯 Agent 4: Portfolio Allocation Advisor</h4>
-                """, unsafe_allow_html=True)
-                st.markdown(results["agent4"])
-                st.markdown("</div>", unsafe_allow_html=True)
+            st.markdown("""
+            <div style="background: rgba(30, 30, 60, 0.2); border: 1px solid rgba(255, 255, 255, 0.05); padding: 1.5rem; border-radius: 15px; margin-bottom: 1.5rem; border-left: 5px solid #ffd200;">
+                <h4 style="color: #ffd200; margin-top: 0; display: flex; align-items: center; gap: 0.5rem;">🔢 Quantitative Metrics Parser</h4>
+            """, unsafe_allow_html=True)
+            st.markdown(results["agent2"])
+            st.markdown("</div>", unsafe_allow_html=True)
+            
+            st.markdown("""
+            <div style="background: rgba(30, 30, 60, 0.2); border: 1px solid rgba(255, 255, 255, 0.05); padding: 1.5rem; border-radius: 15px; margin-bottom: 1.5rem; border-left: 5px solid #a18cd1;">
+                <h4 style="color: #a18cd1; margin-top: 0; display: flex; align-items: center; gap: 0.5rem;">🧠 Synthesis & Consensus Engine</h4>
+            """, unsafe_allow_html=True)
+            st.markdown(results["agent3"])
+            st.markdown("</div>", unsafe_allow_html=True)
+            
+            st.markdown("""
+            <div style="background: rgba(30, 30, 60, 0.2); border: 1px solid rgba(255, 255, 255, 0.05); padding: 1.5rem; border-radius: 15px; margin-bottom: 1.5rem; border-left: 5px solid #00b09b;">
+                <h4 style="color: #00b09b; margin-top: 0; display: flex; align-items: center; gap: 0.5rem;">🎯 Portfolio Allocation Advisor</h4>
+            """, unsafe_allow_html=True)
+            st.markdown(results["agent4"])
+            st.markdown("</div>", unsafe_allow_html=True)
+            
+            # Actionable directive TL;DR card at the very bottom
+            st.markdown(f"""
+            <div style="background: linear-gradient(135deg, #1e3f35 0%, #112217 100%); border: 2px solid #00b09b; padding: 2rem; border-radius: 20px; margin-top: 2.5rem; margin-bottom: 2rem; border-left: 8px solid #00b09b; box-shadow: 0 8px 32px 0 rgba(0, 176, 155, 0.25);">
+                <h3 style="color: #00f2fe; margin-top: 0; display: flex; align-items: center; gap: 0.5rem; font-weight: 800;">🎯 Actionable TL;DR Consensus Directive</h3>
+                <p style="color: #c9d1d9; font-size: 1.05rem; margin-bottom: 1.5rem;">
+                    Consolidated strategic summary of the multi-agent consensus panel analysis for <b>{ticker}</b>.
+                </p>
+                <div style="display: flex; gap: 2rem; flex-wrap: wrap; margin-bottom: 1.5rem;">
+                    <div style="flex: 1; min-width: 200px; background: rgba(0,0,0,0.25); padding: 1rem; border-radius: 10px; border: 1px solid rgba(255,255,255,0.05);">
+                        <span style="font-size: 0.85rem; color: #8f9cae; font-weight: bold; text-transform: uppercase;">Consensus Action</span>
+                        <h4 style="margin: 5px 0 0 0; color: #00b09b; font-size: 1.6rem; font-weight: 800;">{action}</h4>
+                    </div>
+                    <div style="flex: 1; min-width: 200px; background: rgba(0,0,0,0.25); padding: 1rem; border-radius: 10px; border: 1px solid rgba(255,255,255,0.05);">
+                        <span style="font-size: 0.85rem; color: #8f9cae; font-weight: bold; text-transform: uppercase;">Active Strategy Return</span>
+                        <h4 style="margin: 5px 0 0 0; color: #ffd200; font-size: 1.6rem; font-weight: 800;">{multi_trade_results.get('strategy_return_pct', 0.0):+.2f}%</h4>
+                    </div>
+                    <div style="flex: 1; min-width: 200px; background: rgba(0,0,0,0.25); padding: 1rem; border-radius: 10px; border: 1px solid rgba(255,255,255,0.05);">
+                        <span style="font-size: 0.85rem; color: #8f9cae; font-weight: bold; text-transform: uppercase;">Target Entry Price (SMA)</span>
+                        <h4 style="margin: 5px 0 0 0; color: #00f2fe; font-size: 1.6rem; font-weight: 800;">${latest_row.get('SMA_20', latest_close):,.2f}</h4>
+                    </div>
+                </div>
+                <div style="color: #c9d1d9; font-size: 0.95rem; line-height: 1.6;">
+                    <b>Core Directive:</b> Technical indicators, risk-reward ratios, sentiment indexes, and the Active Multi-Trade Simulation have converged. 
+                    Refer to the <b>Synthesis & Consensus Engine</b> for the consensus analysis details and the <b>Portfolio Allocation Advisor</b> for the portfolio allocation and capital distribution sizing limits.
+                </div>
+            </div>
+            """, unsafe_allow_html=True)
             
             # Button to clear cache and rerun
             if st.button("🔄 Clear & Re-Run Consensus Analysis"):
